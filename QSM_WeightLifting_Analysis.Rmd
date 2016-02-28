@@ -1,0 +1,283 @@
+---
+title: 'Quantified Self Movement: Classification of Form'
+author: "Damon Grummet"
+date: "28 February 2016"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+#Libraries
+library(ggplot2)
+library(caret)
+library(sqldf)
+library(plot3D)
+library(corrplot)
+
+#lock random seed for reproducibility
+
+set.seed(74843)
+```
+
+## Preface
+
+The prevalence of movement monitoring functionality in mobile devices has led to cheaper and easier analysis of various movement behaviors.  The research team at 'groupware@LES' ('http://groupware.les.inf.puc-rio.br/') have been studying this field, and they have kindly provided access to their 'Weight Lifting Exercises' data-set ('http://groupware.les.inf.puc-rio.br/har') for learning exercises.  
+
+The Weight Lifting Exercises data-set provides accelerometer data measurements of 5 subjects who were tasked with lifting weights following the 'Unilateral Dumbbell Biceps Curl', specifically performing the exercise correctly (1 class) and incorrectly (4 classes) to provide data for attempting to generate algorithms to classify the movements automatically.
+
+This document is this author's attempt to select an acceptable classification algorithm using standard machine-learning methods, as taught in the associated course 'Practical Machine Learning', a MOOC made available via Coursera.
+
+The following sections outline data exploration, preprocessing, model fitting and selection, using customised training and testing data-sets provided via the class assignment.
+
+## Data Analysis and Preprocessing
+
+The provided data was loaded into two raw sets, downloaded as train.csv and test.csv.  An initial review of the data showed that there were two distinct data-sets present within the training file - raw readings from each subject, and summary lines showing the statistical summary for each set of raw readings.  As we only want to work with the raw data, only the following subset of data was retained:
+
+```{r datasets, echo=TRUE, cache=TRUE, message=FALSE}
+rawtrainData <- read.csv("train.csv")
+rawtestData <- read.csv("test.csv")
+#data cleansing
+# through raw data observation of the trainData set, there are 19216 records (of 19622) 
+# where a large number of variables are either blank or '#DIV/0!'
+#
+# Also, there are two types of observations in the data, indicated by the value
+# of variable 'new_window' - where it is 'yes' summary data is shown, for the columns
+# such as max_roll_belt, min_pitch_arm and so on.
+# As these are summary computed data, we will exclude them, along with all the columns
+# that store only those values.
+# We also have no interest in the timestamp, the window number, or ....
+# In fact, we are only interested in the raw accelerometer movements for prediction.
+
+trainData <- sqldf('select roll_belt,
+                    pitch_belt,
+                   yaw_belt,
+                   total_accel_belt,
+                   gyros_belt_x,
+                   gyros_belt_y,
+                   gyros_belt_z,
+                   accel_belt_x,
+                   accel_belt_y,
+                   accel_belt_z,
+                   magnet_belt_x,
+                   magnet_belt_y,
+                   magnet_belt_z,
+                   roll_arm,
+                   pitch_arm,
+                   yaw_arm,
+                   total_accel_arm,
+                   gyros_arm_x,
+                   gyros_arm_y,
+                   gyros_arm_z,
+                   accel_arm_x,
+                   accel_arm_y,
+                   accel_arm_z,
+                   magnet_arm_x,
+                   magnet_arm_y,
+                   magnet_arm_z,
+                   roll_dumbbell,
+                   pitch_dumbbell,
+                   yaw_dumbbell,
+                   total_accel_dumbbell,
+                   gyros_dumbbell_x,
+                   gyros_dumbbell_y,
+                   gyros_dumbbell_z,
+                   accel_dumbbell_x,
+                   accel_dumbbell_y,
+                   accel_dumbbell_z,
+                   magnet_dumbbell_x,
+                   magnet_dumbbell_y,
+                   magnet_dumbbell_z,
+                   roll_forearm,
+                   pitch_forearm,
+                   yaw_forearm,
+                   total_accel_forearm,
+                   gyros_forearm_x,
+                   gyros_forearm_y,
+                   gyros_forearm_z,
+                   accel_forearm_x,
+                   accel_forearm_y,
+                   accel_forearm_z,
+                   magnet_forearm_x,
+                   magnet_forearm_y,
+                   magnet_forearm_z,
+                   classe
+                   from rawtrainData
+                   where new_window = "no"')
+
+```
+
+```{r featurePlot, ECHO=FALSE, message=FALSE}
+#feature plot example, suggesting there are three distinct patterns of data 
+# (in keeping with intuition of the exercise movements likely)(also a relation to the
+# num_window variable, which has been omitted from the training data as it is not 
+# constructive to the prediction exercise)
+featurePlot(trainData[,1:4], as.factor(trainData$classe), plot="pairs", auto.key = list(columns=5))
+```
+
+The outcome variable in the data is called 'classe', and is a categorical factor with five levels marked 'A' through 'E'.  It is unknown which of these categories represents a correct form (information not provided in assignment notes).
+
+The data can be visualised in 3 dimensions, showing a pattern that is suggestive of the actual movement of lifting a weight in a bicep curl:
+
+```{r plot3D, echo=FALSE, message=FALSE}
+# magnet_arm_x,y,z:
+
+suppressWarnings(
+  plot3D::points3D(
+    trainData$magnet_arm_x, 
+    trainData$magnet_arm_y, 
+    trainData$magnet_arm_z, 
+    col=trainData$classe,
+    main="3D rendering of magnet_arm_(x,y,z)",
+    pch=20, cex=0.8
+  ))
+```
+
+Next is a check for limited variance in any of the variables.  If the variance is near zero, the variable should be omitted.  However in this data-set no variables have near-zero variance.
+
+```{r zerovariance, message=FALSE}
+#Check for feature variance - anything close to zero should be omitted:
+nearZeroVar(trainData, saveMetrics=TRUE)
+```
+
+Using a correlation matrix, approximately half the features show high correlation, suggesting the model fitting will benefit from feature reduction.  PCA will be used in the model fitting.
+
+```{r correlation, echo=FALSE, message=FALSE}
+
+col4 <- colorRampPalette(c("#7F0000", "red", "#FF7F00", "yellow", "#7FFF7F", 
+                           "cyan", "#007FFF", "blue", "#00007F"))
+corrplot.mixed(cor(trainData[,-53]), lower="circle", upper="color", 
+               tl.pos="lt", diag="n", order="hclust", hclust.method="complete", col = col4(10))
+#shows there are about half the parameters that correlate, so tidying and PCA is needed.
+```
+
+Before generating model fit, the data needs to be centered and normalized, and split into subsets for training and validation (70/30):
+```{r preprocess, cache=TRUE, message=FALSE}
+#center and normalize data
+preProcObj <- preProcess(trainData[, -53],method=c("center","scale"))
+
+trainData <- cbind(predict(preProcObj, trainData[, -53]),classe=trainData[,53])
+
+# need a fit training and testing set, so split the data 70/30:
+inTrain <- createDataPartition(y=trainData$classe,p=0.7, list=FALSE)
+training <- trainData[inTrain,]
+testing <- trainData[-inTrain,]
+```
+
+## Model Fitting and Selection
+
+Due to the nature of the exercise, being classification into one of five categories, and the data being multidimensional in nature with a large number of potentially significant features, a linear model would require significant re-factoring to fit.  Instead, the major machine-learning algorithms of Trees, Random Forests (RF), and  Generalized Boosting Regression (GBM) will be used and tested.
+
+Note, given there are under 20,000 observations in the raw training data, splitting the data (as done here to provide a validation set) is likely to negatively impact the accuracy of the model training.  Hence, a cross-validation method needs to be employed to mitigate loss of accuracy.  Here we use 10 folds for all the models.
+
+```{r modelfitting, cache=TRUE, message=FALSE}
+
+# using 10-fold Cross-Validation
+fitControl <- trainControl(method="cv",
+                           number=10,
+                           verboseIter=FALSE,
+                           allowParallel=TRUE)
+
+#tree model (for comparison):
+fittree <- train(classe~.,data=training,method="rpart", trControl=fitControl, preProcess=c("pca"))
+fittree$finalModel
+treePred <- predict(fittree,testing)
+confusionMatrix(testing$classe,treePred)
+
+
+#Parallel Random Forest:
+suppressWarnings(
+fitRFpar <- train(classe~.,data=training,method="parRF", trControl=fitControl, preProcess=c("pca"))
+)
+predRFpar <- predict(fitRFpar,testing)
+confusionMatrix(testing$classe,predRFpar)
+
+
+#Bagging with trees
+fitGBM <- train(classe ~ ., method="gbm",data=training,trControl=fitControl,verbose=FALSE, preProcess=c("pca"))
+predGBM <- predict(fitGBM,testing)
+confusionMatrix(testing$classe,predGBM)
+```
+
+Comparing the three chosen models gives the following summary and chart:
+
+```{r selection, message=FALSE}
+#Model Fittness and Selection
+
+# collect resamples
+results = resamples(list(GBM=fitGBM, RandomForest=fitRFpar, Tree=fittree))
+
+# summarize the distributions
+summary(results)
+# boxplots of results
+bwplot(results)
+```
+
+From these tests the model with the best fit (of 97% with the selected random seed) is Random Forest, which has a no-information rate of 29% and a Mcnemar's Test P-Value of 2.6e-6 on the validation set.
+
+## Conclusion
+For the given training data, the Random Forest model has demonstrated the highest accuracy rate of 97% for correct classification of exercise method used.
+
+This model can now be used to predict the categories of the provided test data-set, as follows:
+```{r testdata, cache=TRUE, message=FALSE}
+#Apply prediction model to test data
+testData <- sqldf('select user_name,
+                    roll_belt,
+                    pitch_belt,
+                   yaw_belt,
+                   total_accel_belt,
+                   gyros_belt_x,
+                   gyros_belt_y,
+                   gyros_belt_z,
+                   accel_belt_x,
+                   accel_belt_y,
+                   accel_belt_z,
+                   magnet_belt_x,
+                   magnet_belt_y,
+                   magnet_belt_z,
+                   roll_arm,
+                   pitch_arm,
+                   yaw_arm,
+                   total_accel_arm,
+                   gyros_arm_x,
+                   gyros_arm_y,
+                   gyros_arm_z,
+                   accel_arm_x,
+                   accel_arm_y,
+                   accel_arm_z,
+                   magnet_arm_x,
+                   magnet_arm_y,
+                   magnet_arm_z,
+                   roll_dumbbell,
+                   pitch_dumbbell,
+                   yaw_dumbbell,
+                   total_accel_dumbbell,
+                   gyros_dumbbell_x,
+                   gyros_dumbbell_y,
+                   gyros_dumbbell_z,
+                   accel_dumbbell_x,
+                   accel_dumbbell_y,
+                   accel_dumbbell_z,
+                   magnet_dumbbell_x,
+                   magnet_dumbbell_y,
+                   magnet_dumbbell_z,
+                   roll_forearm,
+                   pitch_forearm,
+                   yaw_forearm,
+                   total_accel_forearm,
+                   gyros_forearm_x,
+                   gyros_forearm_y,
+                   gyros_forearm_z,
+                   accel_forearm_x,
+                   accel_forearm_y,
+                   accel_forearm_z,
+                   magnet_forearm_x,
+                   magnet_forearm_y,
+                   magnet_forearm_z
+                   from rawtestData
+                   where new_window = "no"')
+
+#remember to apply the preprocessing and PCA analysis in preProcObj:
+answers = predict(fitRFpar, newdata=predict(preProcObj,testData))
+
+```
